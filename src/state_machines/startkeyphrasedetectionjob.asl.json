@@ -1,0 +1,30 @@
+{
+  "Comment": "Runs Lambda used to process Key Phrase Extract File Created Queue ",
+  "StartAt": "Process Queue",
+  "States": {
+    "Process Queue": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "Payload.$": "$",
+        "FunctionName": "${startKeyPhraseJobLambdaArn}"
+      },
+      "Next": "More Messages"
+    },
+    "More Messages": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.moreMessages",
+          "BooleanEquals": true,
+          "Next": "Process Queue"
+        }
+      ],
+      "Default": "Success"
+    },
+    "Success": {
+      "Type": "Succeed"
+    }
+  }
+}

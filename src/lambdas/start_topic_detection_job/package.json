@@ -1,0 +1,15 @@
+{
+  "name": "start_topic_detection_complete_job",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "mysql2": "^2.3.3-rc.0"
+  }
+}

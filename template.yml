@@ -1,0 +1,906 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  comprehend-jobrunner
+
+Transform:
+- AWS::Serverless-2016-10-31
+
+Parameters:
+  LogRetentionDays:
+    Type: String
+    AllowedPattern: ".*"
+    ConstraintDescription: "This is a required parameter"
+    Default: 90
+
+Globals:
+  Function:
+      Runtime: nodejs14.x
+      MemorySize: 256
+      Timeout: 900
+      Layers:
+        - !Ref CommonLambdaLayer
+
+Resources:
+  CommonLambdaLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ./src/lambdas/common_layer
+      CompatibleRuntimes:
+        - nodejs14.x
+    Metadata: 
+      BuildMethod: nodejs14.x
+
+
+# The root user should always have all permissions to the Key
+# The Log group names are hardcoded to avoid circular dependencies
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      Description: KMS Key for Comprehend-Jobrunner implementation
+      MultiRegion: false
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ""
+                  -
+                    - "arn:aws:iam::"
+                    - Ref: "AWS::AccountId"
+                    - ":root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: "Enable Cloudwatch permissions for TopicDetectionExtracterStateMachine"
+            Effect: "Allow"
+            Principal: 
+              Service:
+                !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnEquals:  
+                "aws:SourceArn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:TopicDetectionExtracterStateMachine"
+          - Sid: "Enable Cloudwatch permissions for StartTopicDetectionJobStateMachineLogGroup"
+            Effect: "Allow"
+            Principal: 
+              Service:
+                !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnEquals:  
+                "aws:SourceArn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:StartKeyPhraseDetectionJobStateMachine"
+          - Sid: "Enable Cloudwatch permissions for StartKeyPhraseDetectionJobStateMachineLogGroup"
+            Effect: "Allow"
+            Principal: 
+              Service:
+                !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnEquals:  
+                "aws:SourceArn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:StartTopicDetectionJobStateMachine"
+          - Sid: "Enable Cloudwatch permissions for TopicDetectionCompletedEventBridgeRuleLogGroup"
+            Effect: "Allow"
+            Principal: 
+              Service:
+                !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnEquals:  
+                "aws:SourceArn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/${AWS::StackName}/topic_detection_output_created"
+          - Sid: "Enable Cloudwatch permissions for KeyPhraseCompletedEventBridgeRuleLogGroup"
+            Effect: "Allow"
+            Principal: 
+              Service:
+                !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnEquals:  
+                "aws:SourceArn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/${AWS::StackName}/keyphrase_detection_output_created"
+          - Sid: "Enable Cloudwatch permissions for ExtractFileCreatedEventBridgeRule"
+            Effect: "Allow"
+            Principal: 
+              Service:
+                !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+            Condition:
+              ArnEquals:  
+                "aws:SourceArn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/${AWS::StackName}/extract_file_created"
+
+          - Sid: "Enable Cloudwatch Logs permissions for lambdas"
+            Effect: "Allow"
+            Principal: 
+              Service:
+                !Sub "lambda.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: "*"
+
+####### Topic Modeling Resources
+
+  TopicDetectionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+
+            
+  # TopicDetectionBucketPolicy:
+  #   Type: AWS::S3::BucketPolicy
+  #   Properties:
+  #     PolicyDocument:
+  #       Id: AllowSSLRequestsOnly
+  #       Version: '2012-10-17'
+  #       Statement:
+  #       - Sid: AllowSSLRequestsOnly
+  #         Effect: Deny
+  #         Principal: "*"
+  #         Action: "s3:*"
+  #         Resource:
+  #           Fn::Join:
+  #           - ''
+  #           - - 'arn:aws:s3:::'
+  #             - Ref: TopicDetectionBucket
+  #             - "/*"
+  #         Condition:
+  #           Bool:
+  #             "aws:SecureTransport": false
+  #     Bucket:
+  #       Ref: TopicDetectionBucket
+
+  StartTopicDetectionJobLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      RetentionInDays: !Ref LogRetentionDays
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref StartTopicDetectionJob]]
+
+  StartTopicDetectionJob:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambdas/start_topic_detection_job
+      FunctionName: Jobs_3_StartTopicDetectionJob
+      Handler: index.handler
+      Description: Starts the topic detection job after the extract file is saved to S3
+      Environment:
+        Variables:
+          ComprehendRole: !GetAtt ComprehendRole.Arn
+          ExtractFileCreatedQueue: !Ref ExtractFileCreatedQueue
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref TopicDetectionBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ExtractFileCreatedQueue.QueueName
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - comprehend:StartTopicsDetectionJob
+                - comprehend:ListTopicsDetectionJobs
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - iam:passRole
+              Resource: !GetAtt ComprehendRole.Arn
+            - Effect: Allow
+              Action:
+                - servicequotas:GetServiceQuota
+              Resource: !Sub "arn:aws:servicequotas:${AWS::Region}:${AWS::AccountId}:comprehend/L-F2BED405" 
+
+  StartKeyPhraseDetectionJobLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties: 
+      RetentionInDays: !Ref LogRetentionDays
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref StartKeyPhraseDetectionJob]]
+
+  StartKeyPhraseDetectionJob:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambdas/start_keyphrase_detection_job
+      FunctionName: Jobs_3_KeyPhraseDetection_StartJob
+      Handler: index.handler
+      Description: Starts the key phrase detection job after the extract file is saved to S3
+      Environment:
+        Variables:
+          ComprehendRole: !GetAtt ComprehendRole.Arn
+          KeyPhraseExtractFileCreatedQueue: !Ref KeyPhraseExtractFileCreatedQueue
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref TopicDetectionBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt KeyPhraseExtractFileCreatedQueue.QueueName
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - comprehend:StartKeyPhrasesDetectionJob
+                - comprehend:ListKeyPhrasesDetectionJobs
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - iam:passRole
+              Resource: !GetAtt ComprehendRole.Arn
+            - Effect: Allow
+              Action:
+                - servicequotas:GetServiceQuota
+              Resource: !Sub "arn:aws:servicequotas:${AWS::Region}:${AWS::AccountId}:comprehend/L-BFFD1421" 
+  ComprehendRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: comprehend.amazonaws.com
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "ComprehendPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub "arn:aws:s3:::${TopicDetectionBucket}"
+                  - !Sub "arn:aws:s3:::${TopicDetectionBucket}/*"
+
+  StartTopicDetectionJobStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: StartTopicDetectionJobStateMachine
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      RetentionInDays:  !Ref LogRetentionDays
+
+  ExtractFileHasMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm when the ExtractFileCreatedQueue has messages"
+      Namespace: "AWS/SQS"
+      AlarmName: StartTopicQueueHasItems2
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - Name: "QueueName"
+          Value:
+            Fn::GetAtt:
+              - "ExtractFileCreatedQueue"
+              - "QueueName"
+      Statistic: "Sum"
+      Period: 300  
+      DatapointsToAlarm: 1 
+      EvaluationPeriods: 1       
+      Threshold: 1
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+
+  KeyPhraseExtractFileCreatedQueueeHasMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm when the KeyPhraseExtractFileCreatedQueuee has messages"
+      Namespace: "AWS/SQS"
+      AlarmName: StartKeyPhraseHasItems
+      MetricName: "ApproximateNumberOfMessagesVisible"
+      Dimensions:
+        - Name: "QueueName"
+          Value:
+            Fn::GetAtt:
+              - "KeyPhraseExtractFileCreatedQueue"
+              - "QueueName"
+      Statistic: "Sum"
+      Period: 300  
+      DatapointsToAlarm: 1 
+      EvaluationPeriods: 1       
+      Threshold: 1
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+      
+  KeyPhraseExtractFileCreatedQueueHasMessagesRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - events.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action: states:StartExecution
+            Effect: Allow
+            Resource:
+              Ref: StartKeyPhraseDetectionJobStateMachine
+        PolicyName: KeyPhraseExtractFileRule
+    Type: AWS::IAM::Role
+
+  StartTopicDetectionJobStateMachineQueueHasItemsRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - events.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action: states:StartExecution
+            Effect: Allow
+            Resource:
+              Ref: StartTopicDetectionJobStateMachine
+        PolicyName: StartTopicDetectionJobStateMachineQueueHasItemsRoleStartExecutionPolicy
+    Type: AWS::IAM::Role
+
+
+  StartTopicDetectionJobRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: StartTopicDetectionJobRule
+      EventPattern:
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - "ALARM"
+          alarmName:
+          - Ref: ExtractFileHasMessagesAlarm
+        source:
+        - aws.cloudwatch
+      Targets:
+      - Arn:
+          Ref: StartTopicDetectionJobStateMachine
+        Id: StartTopicQueueHasItems
+        RoleArn:
+          Fn::GetAtt:
+          - StartTopicDetectionJobStateMachineQueueHasItemsRole
+          - Arn
+
+  StartKeyPhraseDetectionJobRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: StartKeyPhraseDetectionJobRule
+      EventPattern:
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - "ALARM"
+          alarmName:
+          - Ref: KeyPhraseExtractFileCreatedQueueeHasMessagesAlarm
+        source:
+        - aws.cloudwatch
+      Targets:
+      - Arn:
+          Ref: StartKeyPhraseDetectionJobStateMachine
+        Id: StartKeyPhraseDetection
+        RoleArn:
+          Fn::GetAtt:
+          - KeyPhraseExtractFileCreatedQueueHasMessagesRole
+          - Arn
+
+  StartTopicDetectionJobStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: src/state_machines/starttopicdetectionjob.asl.json
+      Name: RunTopicDetectionJob
+      DefinitionSubstitutions:
+        startTopicDetectionJobLambdaArn: !GetAtt StartTopicDetectionJob.Arn
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StartTopicDetectionJobStateMachineLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      Policies:
+        - CloudWatchLogsFullAccess
+        - Statement:
+          - Sid: LambdaInvoke
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt StartTopicDetectionJob.Arn
+
+  StartKeyPhraseDetectionJobStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: StartKeyPhraseDetectionJobStateMachine
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      RetentionInDays:  !Ref LogRetentionDays
+
+  StartKeyPhraseDetectionJobStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: src/state_machines/startkeyphrasedetectionjob.asl.json
+      Name: RunKeyPhraseDetectionJobs
+      DefinitionSubstitutions:
+        startKeyPhraseJobLambdaArn: !GetAtt StartKeyPhraseDetectionJob.Arn
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StartKeyPhraseDetectionJobStateMachineLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      Policies:
+        - CloudWatchLogsFullAccess
+        - Statement:
+          - Sid: LambdaInvoke
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt StartKeyPhraseDetectionJob.Arn
+
+#####
+
+
+  DeadLetterS3TopicDetectionFileCreatedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: !GetAtt EncryptionKey.KeyId
+      QueueName: S3TopicDetectionFileCreatedQueueDLQ
+      VisibilityTimeout: 100
+
+  TopicDectionCompleteJobLambdaLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DependsOn: "TopicDectionCompleteJobLambda"
+    Properties: 
+      RetentionInDays: !Ref LogRetentionDays
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref TopicDectionCompleteJobLambda]]
+
+  TopicDectionCompleteJobLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambdas/topic_detection_complete_job
+      Handler: index.handler
+      FunctionName: Jobs_4_TopicDetection_CompleteJob
+      Description: Saves the result of topic detection to the database
+      Events:
+        SQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TopicDetectionCompletedQueue.Arn
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref TopicDetectionBucket
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - comprehend:StartTopicsDetectionJob
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - iam:passRole
+              Resource: !GetAtt ComprehendRole.Arn
+
+  KeyPhraseDetectionCompleteJobLambdaLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    DependsOn: "KeyPhraseDetectionCompleteJobLambda"
+    Properties: 
+      RetentionInDays: !Ref LogRetentionDays
+      LogGroupName: !Join ["", ["/aws/lambda/", !Ref KeyPhraseDetectionCompleteJobLambda]]
+
+
+  KeyPhraseDetectionCompleteJobLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/lambdas/keyphrase_detection_completed_job
+      FunctionName: Jobs_4_KeyPhraseDetection_CompleteJob
+      Handler: index.handler
+      Timeout: 100
+      Description: Runs after the Keyphrase detection job is complete.
+      Events:
+        SQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt KeyPhraseDetectionCompletedQueue.Arn
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref TopicDetectionBucket
+
+
+
+  CloudTrailS3bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+
+  # CloudTrailS3bucketBucketPolicy:
+  #   Type: AWS::S3::BucketPolicy
+  #   Properties:
+  #     PolicyDocument:
+  #       Id: AllowSSLRequestsOnly
+  #       Version: '2012-10-17'
+  #       Statement:
+  #       - Sid: AllowSSLRequestsOnly
+  #         Effect: Deny
+  #         Principal: "*"
+  #         Action: "s3:*"
+  #         Resource:
+  #           Fn::Join:
+  #           - ''
+  #           - - 'arn:aws:s3:::'
+  #             - Ref: CloudTrailS3bucket
+  #             - "/*"
+  #         Condition:
+  #           Bool:
+  #             "aws:SecureTransport": false
+  #     Bucket:
+  #       Ref: CloudTrailS3bucket
+
+  LambdaIamRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+          AssumeRolePolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                  -
+                      Effect: Allow
+                      Principal:
+                          Service:
+                              - lambda.amazonaws.com
+                      Action:
+                          - 'sts:AssumeRole'
+          Path: /
+          Policies:
+              -
+                  PolicyName: root
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          -
+                              Effect: Allow
+                              Action:
+                                  - 's3:GetObject'
+                              Resource:
+                                - !Sub '${TopicDetectionBucket.Arn}'
+                                - !Sub '${TopicDetectionBucket.Arn}/*'
+                          -
+                              Effect: Allow
+                              Action:
+                                  - 'logs:CreateLogGroup'
+                                  - 'logs:CreateLogStream'
+                                  - 'logs:PutLogEvents'
+                              Resource: 'arn:aws:logs:*:*:*'
+
+  LambdaPermissions:
+      Type: AWS::Lambda::Permission
+      Properties:
+          FunctionName: !GetAtt StartTopicDetectionJob.Arn
+          Action: lambda:InvokeFunction
+          Principal: events.amazonaws.com
+          SourceArn: !GetAtt ExtractFileCreatedEventBridgeRule.Arn
+  
+  
+  ExtractFileCreatedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ExtractFileCreatedForJobs
+      #KmsMasterKeyId: alias/aws/sqs
+      VisibilityTimeout: 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ExtractFileCreatedQueueDLQ.Arn
+        maxReceiveCount: 5
+
+  ExtractFileCreatedQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ExtractFileCreatedQueueDLQ
+      KmsMasterKeyId: alias/aws/sqs   
+
+
+  KeyPhraseExtractFileCreatedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: KeyPhraseExtractFileCreated
+      VisibilityTimeout: 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt KeyPhraseExtractFileCreatedQueueDLQ.Arn
+        maxReceiveCount: 5
+
+  KeyPhraseExtractFileCreatedQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: KeyPhraseExtractFileCreatedQueueDLQ
+      KmsMasterKeyId: alias/aws/sqs
+
+  KeyPhraseDetectionCompletedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: KeyPhraseDetectionJobCompleted
+      #KmsMasterKeyId: alias/aws/sqs
+      VisibilityTimeout: 900
+
+  
+  TopicDetectionCompletedQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: TopicDetectionJobCompleted
+      VisibilityTimeout: 900
+
+  EventBridgeToSqsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal: 
+            Service: events.amazonaws.com
+          Action: 
+           - SQS:SendMessage
+           - SQS:ReceiveMessage
+           - SQS:GetQueueAttributes
+          Resource: !GetAtt ExtractFileCreatedQueue.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !GetAtt ExtractFileCreatedEventBridgeRule.Arn
+        - Effect: Allow
+          Principal: 
+            Service: events.amazonaws.com
+          Action: 
+           - SQS:SendMessage
+           - SQS:ReceiveMessage
+           - SQS:GetQueueAttributes
+          Resource: !GetAtt KeyPhraseExtractFileCreatedQueue.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !GetAtt ExtractFileCreatedEventBridgeRule.Arn
+      Queues: 
+        - !Ref ExtractFileCreatedQueue
+        - !Ref KeyPhraseExtractFileCreatedQueue
+
+  KeyPhraseDetectionCompletedEventBridgeToSqsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal: 
+            Service: events.amazonaws.com
+          Action: 
+           - SQS:SendMessage
+           - SQS:ReceiveMessage
+           - SQS:GetQueueAttributes
+          Resource: !GetAtt KeyPhraseDetectionCompletedQueue.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !GetAtt KeyPhraseCompletedEventBridgeRule.Arn
+      Queues: 
+        - !Ref KeyPhraseDetectionCompletedQueue
+
+  TopicDetectionCompletedEventBridgeToSqsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal: 
+            Service: events.amazonaws.com
+          Action: 
+           - SQS:SendMessage
+           - SQS:ReceiveMessage
+           - SQS:GetQueueAttributes
+          Resource: !GetAtt TopicDetectionCompletedQueue.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !GetAtt TopicDetectionCompletedEventBridgeRule.Arn
+      Queues: 
+        - !Ref TopicDetectionCompletedQueue            
+
+  EventBridgeLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub '/aws/events/${AWS::StackName}/extract_file_created'
+          RetentionInDays: 7
+          KmsKeyId: !GetAtt EncryptionKey.Arn
+
+
+
+  TopicDetectionCompletedEventBridgeRuleLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub '/aws/events/${AWS::StackName}/topic_detection_output_created'
+          RetentionInDays: 7
+          KmsKeyId: !GetAtt EncryptionKey.Arn
+
+
+  KeyPhraseCompletedEventBridgeRuleLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+          LogGroupName: !Sub '/aws/events/${AWS::StackName}/keyphrase_detection_output_created'
+          RetentionInDays: 7
+          KmsKeyId: !GetAtt EncryptionKey.Arn
+
+
+  ExtractFileCreatedEventBridgeRule:
+      Type: AWS::Events::Rule
+      Properties:
+          Description: 'Rule, that send S3 events to Lambda function'
+          State: 'ENABLED'
+          Name: ExtractFileCreated
+          EventPattern:
+              source:
+                  - 'aws.s3'
+              detail-type:
+                  - 'AWS API Call via CloudTrail'
+              detail:
+                  eventSource:
+                      - 's3.amazonaws.com'
+                  eventName:
+                      - 'PutObject'
+                  requestParameters:
+                      bucketName:
+                        - !Sub '${TopicDetectionBucket}'
+                      key:
+                        - prefix: 'extracts/'
+          Targets:
+              -
+                  Arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${EventBridgeLogGroup}'
+                  Id: !Sub 'EventBridgeLogGroup'
+              - 
+                  Arn: !GetAtt ExtractFileCreatedQueue.Arn
+                  Id: ExtractFileCreatedQueue
+              - 
+                  Arn: !GetAtt KeyPhraseExtractFileCreatedQueue.Arn
+                  Id: KeyPhraseExtractFileCreatedQueue
+
+
+  KeyPhraseCompletedEventBridgeRule:
+      Type: AWS::Events::Rule
+      Properties:
+          Description: 'Rule, that send S3 events to Lambda function'
+          State: 'ENABLED'
+          Name: KeyPhraseJobComplete
+          EventPattern:
+              source:
+                  - 'aws.s3'
+              detail-type:
+                  - 'AWS API Call via CloudTrail'
+              detail:
+                  eventSource:
+                      - 's3.amazonaws.com'
+                  eventName:
+                      - 'PutObject'
+                  requestParameters:
+                      bucketName:
+                        - !Sub '${TopicDetectionBucket}'
+                      key:
+                        - prefix: 'output/keyphrases/'
+          Targets:
+              -
+                  Arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${KeyPhraseCompletedEventBridgeRuleLogGroup}'
+                  Id: !Sub 'KeyPhraseEventBridgeLogGroup'
+              - 
+                  Arn: !GetAtt KeyPhraseDetectionCompletedQueue.Arn
+                  Id: KeyPhraseDetectionCompletedQueue
+
+  TopicDetectionCompletedEventBridgeRule:
+      Type: AWS::Events::Rule
+      Properties:
+          Description: 'Rule, that send S3 events to SQS'
+          State: 'ENABLED'
+          Name: TopicDetectionCompleted
+          EventPattern:
+              source:
+                  - 'aws.s3'
+              detail-type:
+                  - 'AWS API Call via CloudTrail'
+              detail:
+                  eventSource:
+                      - 's3.amazonaws.com'
+                  eventName:
+                      - 'PutObject'
+                  requestParameters:
+                      bucketName:
+                        - !Sub '${TopicDetectionBucket}'
+                      key:
+                        - prefix: 'output/topics/'
+          Targets:
+              -
+                  Arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${TopicDetectionCompletedEventBridgeRuleLogGroup}'
+                  Id: !Sub 'TopicDetectionCompletedEventBridgeRule'
+              - 
+                  Arn: !GetAtt TopicDetectionCompletedQueue.Arn
+                  Id: TopicDetectionCompletedQueue
+                                 
+  CloudTrailS3Policy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+          Bucket: !Sub '${CloudTrailS3bucket}'
+          PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                  -
+                      Effect: Allow
+                      Principal:
+                          Service: 'cloudtrail.amazonaws.com'
+                      Action: 's3:GetBucketAcl'
+                      Resource: !Sub '${CloudTrailS3bucket.Arn}'
+                  -
+                      Effect: Allow
+                      Principal:
+                          Service: 'cloudtrail.amazonaws.com'
+                      Action: 's3:PutObject'
+                      Resource: !Sub '${CloudTrailS3bucket.Arn}/*AWSLogs/${AWS::AccountId}/*'
+                      Condition:
+                          StringEquals:
+                              's3:x-amz-acl': 'bucket-owner-full-control'
+
+  S3ObjectLevelCloudTrail:
+      Type: 'AWS::CloudTrail::Trail'
+      DependsOn:
+          - CloudTrailS3Policy
+      Properties:
+          IsLogging: true
+          IsMultiRegionTrail: true
+          IncludeGlobalServiceEvents: true
+          S3BucketName: !Sub '${CloudTrailS3bucket}'
+          EventSelectors:
+              -
+                  DataResources:
+                      -
+                          Type: 'AWS::S3::Object'
+                          Values:
+                              - !Sub '${TopicDetectionBucket.Arn}/'
+                  IncludeManagementEvents: true
+                  ReadWriteType: All
+
